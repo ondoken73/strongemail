@@ -181,6 +181,32 @@ r = mailer.send(OutgoingEmail(
 - 피드백 루프(ARF: Microsoft JMRP, Yahoo CFL 등) → `mailer.handle_complaint(addr, tenant_id=...)`
 - 원클릭 수신거부 엔드포인트 → `unsubscribe.make_wsgi_app(mailer.tokens, mailer.handle_unsubscribe)`
 
+## 발송 큐와 재시도 워커
+
+`mailer.send` 는 한 번만 시도합니다. 실제 서비스에서는 큐에 넣고 워커가 재시도 일정을 관리합니다.
+
+```python
+from strongemail.mailqueue import MailQueue, Worker, RetryPolicy
+
+queue = MailQueue(store)
+job_id = queue.enqueue(email, idempotency_key="campaign-42:user@naver.com")  # 중복 요청이면 같은 job_id
+queue.enqueue(otp_email, ttl=600)                 # 인증번호: 10분 안에 못 보내면 포기
+queue.enqueue(newsletter, send_at=tomorrow_10am)  # 예약 발송
+
+Worker(queue, mailer, RetryPolicy(base=60, max_attempts=8)).run_forever(stop_event)
+```
+
+| 상황 | 처리 |
+|---|---|
+| 거래성 vs 광고 | 거래성(인증번호·영수증)이 항상 먼저 |
+| 소프트바운스·연결 실패 | `max(서버가 준 대기, 1분·2분·4분… 최대 1시간)` 후 재시도, 실제 SMTP 시도 8회 초과 시 실패 |
+| IP 차단 응답 | 사고 기록 후 재시도 → 같은 풀의 다른 IP 로 나감 |
+| 웜업 한도·평판 중지·풀 중지 | 시도 횟수에 넣지 않고 대기. 같은 배치의 같은 (고객사, 종류, 포털)은 send 를 부르지 않고 바로 미룸 |
+| 수신제외·동의 없음·하드바운스 | 즉시 `failed` (재시도 안 함) |
+| 만료 | 기본 거래성 6시간, 광고 72시간 (`ttl` 로 지정) |
+| 워커 비정상 종료 | lease(5분) 만료 후 다른 워커가 회수 |
+| 취소 | `queue.cancel(job_id, tenant_id)`: 대기 중인 작업만, 그 고객사 것만 |
+
 ## 발송 전 체크리스트
 
 ### 1. DNS / 인프라 (`strongemail audit`)
@@ -231,6 +257,7 @@ strongemail/
   unsubscribe.py  RFC 8058 원클릭 수신거부 토큰/엔드포인트
   sender.py       발송 파이프라인 (관문 → IP 선택 → 고객 도메인 DKIM 서명 → SMTP → 결과 기록), Relay/DirectMX 전송
   tenants.py      고객사·고객 발신 도메인 레지스트리 (도메인 소유 확인, 풀 지정, 정지)
+  mailqueue.py    발송 큐(우선순위·예약·중복 방지·만료) + 재시도 워커
   ip_pool.py      IP 풀, IP·포털별 웜업 한도, 차단 IP 제외, 돌려막기 방지
   domain_setup.py SPF/DKIM/DMARC 레코드 생성·병합, DKIM 키 생성, DMARC 단계 계획, 발신 도메인 검증
   blocklist.py    DNSBL 조회, 차단 원인 판별, 차단 사고 기록, 소명 준비 점검·소명서 생성
@@ -239,7 +266,7 @@ strongemail/
 
 ## 다음 단계 (아직 없는 것)
 
-- 발송 큐/워커 (`DEFERRED` 재시도 스케줄링). 대량이면 KumoMTA·Postfix 같은 MTA 앞단에 이 코어를 둠
+- 대량이면 KumoMTA·Postfix 같은 MTA 앞단에 이 코어를 둠 (큐는 SQLite 기반 → 여러 서버면 PostgreSQL 로 교체)
 - 고객사·DKIM 개인키 영구 저장 (현재 메모리 레지스트리 → DB + KMS), 고객용 도메인 등록 API/화면
 - VERP 반송 주소 생성(고객사·IP 식별)
 - 반송(DSN)·ARF 메일함 파서, DMARC 집계 리포트(rua) 분석기

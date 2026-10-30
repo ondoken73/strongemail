@@ -107,12 +107,15 @@ class Store:
         with self._lock, self._db:
             self._db.executescript("""
                 CREATE TABLE IF NOT EXISTS suppressions (
-                    address TEXT NOT NULL, scope TEXT NOT NULL, reason TEXT NOT NULL, created REAL NOT NULL,
-                    PRIMARY KEY (address, scope));
+                    address TEXT NOT NULL, scope TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL, created REAL NOT NULL,
+                    PRIMARY KEY (address, scope, tenant));
                 CREATE TABLE IF NOT EXISTS events (
-                    ts REAL NOT NULL, kind TEXT NOT NULL, address TEXT NOT NULL,
-                    provider TEXT NOT NULL, sending_domain TEXT NOT NULL);
+                    ts REAL NOT NULL, kind TEXT NOT NULL, address TEXT NOT NULL, provider TEXT NOT NULL,
+                    sending_domain TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '');
                 CREATE INDEX IF NOT EXISTS events_ts ON events (ts, sending_domain, provider);
+                CREATE INDEX IF NOT EXISTS events_ip ON events (ip, provider, ts);
+                CREATE INDEX IF NOT EXISTS events_tenant ON events (tenant, ts);
                 CREATE INDEX IF NOT EXISTS events_addr ON events (address, ts);
             """)
 
@@ -121,30 +124,41 @@ class Store:
             return self._db.execute(sql, params).fetchall()
 
 
+GLOBAL = ""  # tenant value for suppressions that apply to every customer (dead address)
+
+
 class SuppressionList:
+    """수신 제외 목록.
+
+    하드바운스는 주소 자체가 없으므로 모든 고객에게 적용(GLOBAL).
+    스팸 신고·수신거부는 그 고객(tenant)과의 관계이므로 해당 고객에게만 적용.
+    """
+
     def __init__(self, store: Store):
         self._s = store
 
-    def add(self, address: str, scope: SuppressionScope, reason: str) -> None:
-        self._s.execute("INSERT OR REPLACE INTO suppressions VALUES (?, ?, ?, ?)",
-                        (address.lower(), scope.value, reason, time.time()))
+    def add(self, address: str, scope: SuppressionScope, reason: str, tenant: str = GLOBAL) -> None:
+        self._s.execute("INSERT OR REPLACE INTO suppressions VALUES (?, ?, ?, ?, ?)",
+                        (address.lower(), scope.value, tenant, reason, time.time()))
 
-    def remove(self, address: str, scope: SuppressionScope | None = None) -> None:
+    def remove(self, address: str, scope: SuppressionScope | None = None, tenant: str = GLOBAL) -> None:
         if scope is None:
-            self._s.execute("DELETE FROM suppressions WHERE address = ?", (address.lower(),))
+            self._s.execute("DELETE FROM suppressions WHERE address = ? AND tenant = ?", (address.lower(), tenant))
         else:
-            self._s.execute("DELETE FROM suppressions WHERE address = ? AND scope = ?", (address.lower(), scope.value))
+            self._s.execute("DELETE FROM suppressions WHERE address = ? AND scope = ? AND tenant = ?",
+                            (address.lower(), scope.value, tenant))
 
-    def blocked_reason(self, address: str, marketing: bool) -> str | None:
+    def blocked_reason(self, address: str, marketing: bool, tenant: str = GLOBAL) -> str | None:
         scopes = ("all", "marketing") if marketing else ("all",)
         rows = self._s.execute(
-            f"SELECT reason FROM suppressions WHERE address = ? AND scope IN ({','.join('?' * len(scopes))})",
-            (address.lower(), *scopes))
+            f"SELECT reason FROM suppressions WHERE address = ? AND tenant IN (?, ?) "
+            f"AND scope IN ({','.join('?' * len(scopes))})",
+            (address.lower(), GLOBAL, tenant, *scopes))
         return rows[0][0] if rows else None
 
 
 class ReputationMonitor:
-    """Records delivery outcomes and decides whether a domain/provider pair may keep sending."""
+    """Records delivery outcomes and decides whether a domain/provider/tenant/IP may keep sending."""
 
     def __init__(self, store: Store, thresholds: Thresholds = Thresholds(), clock=time.time):
         self._s = self.store = store
@@ -152,17 +166,18 @@ class ReputationMonitor:
         self._clock = clock
         self.suppressions = SuppressionList(store)
 
-    def record(self, kind: BounceKind | str, address: str, provider: str, sending_domain: str) -> None:
+    def record(self, kind: BounceKind | str, address: str, provider: str, sending_domain: str,
+               tenant: str = GLOBAL, ip: str = "") -> None:
         kind = kind.value if isinstance(kind, BounceKind) else kind
         address = address.lower()
-        self._s.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?)",
-                        (self._clock(), kind, address, provider, sending_domain))
+        self._s.execute("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (self._clock(), kind, address, provider, sending_domain, tenant, ip))
         if kind == BounceKind.HARD.value:
             self.suppressions.add(address, SuppressionScope.ALL, "hard_bounce")
         elif kind == "complaint":
-            self.suppressions.add(address, SuppressionScope.ALL, "complaint")
+            self.suppressions.add(address, SuppressionScope.ALL, "complaint", tenant)
         elif kind == "unsubscribe":
-            self.suppressions.add(address, SuppressionScope.MARKETING, "unsubscribe")
+            self.suppressions.add(address, SuppressionScope.MARKETING, "unsubscribe", tenant)
         elif kind == BounceKind.SOFT.value:
             self._maybe_suppress_soft(address)
 
@@ -173,20 +188,30 @@ class ReputationMonitor:
         if len(recent) == self.thresholds.soft_bounce_suppress_after and all(k == "soft" for (k,) in recent):
             self.suppressions.add(address, SuppressionScope.ALL, "repeated_soft_bounce")
 
-    def sent_since(self, since: float, provider: str, sending_domain: str) -> int:
-        return self._s.execute(
-            "SELECT COUNT(*) FROM events WHERE ts >= ? AND provider = ? AND sending_domain = ? AND kind != 'complaint' "
-            "AND kind != 'unsubscribe'", (since, provider, sending_domain))[0][0]
+    @staticmethod
+    def _where(**dims) -> tuple[str, tuple]:
+        cols = {"sending_domain": "sending_domain", "provider": "provider", "tenant": "tenant", "ip": "ip"}
+        parts, params = [], []
+        for k, v in dims.items():
+            if v is not None:
+                parts.append(f"{cols[k]} = ?")
+                params.append(v)
+        return "".join(f" AND {p}" for p in parts), tuple(params)
 
-    def health(self, sending_domain: str, provider: str | None = None) -> HealthReport:
+    def sent_since(self, since: float, *, provider: str | None = None, sending_domain: str | None = None,
+                   ip: str | None = None, tenant: str | None = None) -> int:
+        where, params = self._where(provider=provider, sending_domain=sending_domain, ip=ip, tenant=tenant)
+        return self._s.execute(
+            f"SELECT COUNT(*) FROM events WHERE ts >= ? AND kind NOT IN ('complaint', 'unsubscribe'){where}",
+            (since, *params))[0][0]
+
+    def health(self, sending_domain: str | None = None, provider: str | None = None, *,
+               tenant: str | None = None, ip: str | None = None) -> HealthReport:
         t = self.thresholds
         since = self._clock() - t.window_seconds
-        sql = "SELECT kind, COUNT(*) FROM events WHERE ts >= ? AND sending_domain = ?"
-        params: tuple = (since, sending_domain)
-        if provider:
-            sql += " AND provider = ?"
-            params += (provider,)
-        counts = dict(self._s.execute(sql + " GROUP BY kind", params))
+        where, params = self._where(sending_domain=sending_domain, provider=provider, tenant=tenant, ip=ip)
+        counts = dict(self._s.execute(f"SELECT kind, COUNT(*) FROM events WHERE ts >= ?{where} GROUP BY kind",
+                                      (since, *params)))
         attempts = sum(v for k, v in counts.items() if k not in ("complaint", "unsubscribe"))
         delivered = counts.get("delivered", 0)
         hard = counts.get("hard", 0) / attempts if attempts else 0.0

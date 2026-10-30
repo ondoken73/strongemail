@@ -5,14 +5,19 @@ from .compliance import SenderIdentity, lint_message
 from .dns_audit import audit_domain
 from .domain_setup import SenderDomainRegistry, generate_dkim_key, setup_plan
 from .findings import Finding, Severity
+from .ip_pool import IPPool, IPSelector, SendingIP
 from .providers import PROVIDERS, provider_for
 from .reputation import BounceKind, ReputationMonitor, Store, Thresholds, WarmupPlan, classify_smtp_response
-from .sender import Category, Consent, Mailer, MailerConfig, OutgoingEmail, SMTPTransport, Status
+from .sender import (Category, Consent, DirectMXTransport, Mailer, MailerConfig, OutgoingEmail, RelayTransport,
+                     Status)
+from .tenants import SenderDomain, Tenant, TenantRegistry
 
 __all__ = [
     "AppealContext", "IncidentLog", "build_appeal", "check_dnsbls",
+    "SenderIdentity", "lint_message", "audit_domain",
     "SenderDomainRegistry", "generate_dkim_key", "setup_plan",
-    "SenderIdentity", "lint_message", "audit_domain", "Finding", "Severity", "PROVIDERS", "provider_for",
+    "Finding", "Severity", "IPPool", "IPSelector", "SendingIP", "PROVIDERS", "provider_for",
     "BounceKind", "ReputationMonitor", "Store", "Thresholds", "WarmupPlan", "classify_smtp_response",
-    "Category", "Consent", "Mailer", "MailerConfig", "OutgoingEmail", "SMTPTransport", "Status",
+    "Category", "Consent", "DirectMXTransport", "Mailer", "MailerConfig", "OutgoingEmail", "RelayTransport", "Status",
+    "SenderDomain", "Tenant", "TenantRegistry",
 ]

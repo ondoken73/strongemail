@@ -1,0 +1,19 @@
+[project]
+name = "strongemail"
+version = "0.1.0"
+description = "평판·포털 수신 기준을 지키는 이메일 발송 코어"
+requires-python = ">=3.10"
+dependencies = ["dnspython>=2.4", "dkimpy>=1.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "cryptography>=41"]
+
+[project.scripts]
+strongemail = "strongemail.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["strongemail"]

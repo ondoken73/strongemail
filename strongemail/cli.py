@@ -45,6 +45,14 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("providers", help="포털별 기준 요약")
 
+    sub.add_parser("init-secrets", help="서버용 비밀값(마스터 키, 수신거부 키, 관리자 토큰) 생성")
+    for name, help_ in (("serve", "API 서버 + 발송 워커 + 도메인 재검증 실행"),
+                        ("worker", "발송 워커만 실행 (API 서버와 분리 운영 시)"),
+                        ("service-spf", "서비스 _spf 레코드 출력 (고객이 include 하는 값)"),
+                        ("reverify", "모든 고객 발신 도메인 재검증")):
+        sp = sub.add_parser(name, help=help_)
+        sp.add_argument("--config", default="config.json")
+
     st = sub.add_parser("setup", help="발신 도메인에 등록할 SPF/DKIM/DMARC 레코드 생성 (DKIM 키 생성 포함)")
     st.add_argument("domain")
     st.add_argument("--ip", action="append", default=[], help="발송 IP")
@@ -189,6 +197,29 @@ def main(argv: list[str] | None = None) -> int:
                 log.mark_appealed(i.id)
                 print("소명 제출로 기록했습니다.")
             return 0 if packet.ready else 1
+    if args.cmd == "init-secrets":
+        from .server import init_secrets
+        print(init_secrets())
+        print("\n# 위 값을 비밀 저장소(.env, Vault, KMS 등)에 보관하세요. 마스터 키를 잃으면 DKIM 키를 복구할 수 없습니다.")
+        return 0
+    if args.cmd in ("serve", "worker", "service-spf", "reverify"):
+        from .server import build_service, load_config, serve
+        service = build_service(load_config(args.config))
+        if args.cmd == "serve":
+            serve(service)
+        elif args.cmd == "worker":
+            import threading
+            print("발송 워커 실행 중 (Ctrl+C 로 종료)")
+            try:
+                service.worker.run_forever(threading.Event())
+            except KeyboardInterrupt:
+                pass
+        elif args.cmd == "service-spf":
+            print(service.service_spf())
+        else:
+            for domain, ok in service.reverify_all().items():
+                print(f"{'✓' if ok else '✗'} {domain}")
+        return 0
     if args.cmd == "providers":
         for p in PROVIDERS.values():
             print(f"■ {p.name}  ({', '.join(sorted(p.domains))})  시작 속도 {p.max_per_minute}/분")

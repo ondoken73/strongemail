@@ -83,6 +83,15 @@ class TenantRegistry:
         self._claim(d.domain.lower(), tenant_id)
         self._tenants[tenant_id].add_domain(d)
 
+    def remove_domain(self, tenant_id: str, domain: str) -> None:
+        domain = domain.lower()
+        if self._domain_owner.get(domain) == tenant_id:
+            del self._domain_owner[domain]
+            self._tenants[tenant_id].domains.pop(domain, None)
+
+    def owner_of(self, domain: str) -> str | None:
+        return self._domain_owner.get(domain.lower())
+
     def get(self, tenant_id: str) -> Tenant | None:
         return self._tenants.get(tenant_id)
 

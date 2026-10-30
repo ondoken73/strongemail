@@ -243,3 +243,35 @@ class SenderDomainRegistry:
     def mark_verified(self, domain: str) -> None:
         """테스트/수동 승인용."""
         self._s.execute("INSERT OR REPLACE INTO sender_domains VALUES (?, 1, ?, '')", (domain.lower(), self._clock()))
+
+
+# ------------------------------------------------- 서비스형(멀티 테넌트) 레코드
+
+def service_spf_record(service_domain: str, ips: list[str]) -> DnsRecord:
+    """서비스가 운영하는 `_spf.<서비스도메인>`. 고객은 이것을 include 한 줄로 참조한다.
+
+    include 를 쓰지 않고 ip4/ip6 만 나열해야 고객 SPF 의 DNS 조회 횟수(10회)를 1회만 쓴다.
+    """
+    value = spf_record(ips, all_qualifier="-all")
+    note = "발송 IP 를 추가/교체할 때마다 갱신 — 고객 DNS 는 바꿀 필요 없음."
+    if len(value) > 450:
+        note += " 레코드가 길어 UDP 응답 한도에 가깝습니다. IP 를 CIDR 대역으로 묶으세요."
+    return DnsRecord(f"_spf.{service_domain}", "TXT", value, note)
+
+
+def customer_records(domain: str, *, service_domain: str, selector: str, dkim_txt: str,
+                     existing_spf: str | None = None, rua: str | None = None,
+                     bounce_subdomain: str = "bounce") -> list[DnsRecord]:
+    """고객이 자기 도메인 DNS 에 등록할 레코드."""
+    include = f"_spf.{service_domain}"
+    org = organizational_domain(domain)
+    return [
+        DnsRecord(domain, "TXT", spf_record([], [include], existing_spf),
+                  "기존 SPF 를 이 값으로 교체하세요 (SPF 는 도메인당 1개)." if existing_spf else
+                  "다른 발송 서비스(그룹웨어 등)도 쓰면 그 include 도 같은 레코드에 넣으세요."),
+        DnsRecord(f"{selector}._domainkey.{domain}", "TXT", dkim_txt, "DKIM 공개키 (2048비트)."),
+        DnsRecord(f"_dmarc.{org}", "TXT", dmarc_record(rua or f"dmarc-reports@{org}"),
+                  "이미 DMARC 가 있으면 그대로 두세요. 없으면 p=none 으로 시작."),
+        DnsRecord(f"{bounce_subdomain}.{domain}", "MX", f"10 mx.{service_domain}", "반송 메일 수신 (서비스가 처리)."),
+        DnsRecord(f"{bounce_subdomain}.{domain}", "TXT", f"v=spf1 include:{include} -all", "반송 주소 SPF 정렬."),
+    ]

@@ -181,6 +181,60 @@ r = mailer.send(OutgoingEmail(
 - 피드백 루프(ARF: Microsoft JMRP, Yahoo CFL 등) → `mailer.handle_complaint(addr, tenant_id=...)`
 - 원클릭 수신거부 엔드포인트 → `unsubscribe.make_wsgi_app(mailer.tokens, mailer.handle_unsubscribe)`
 
+## 서버 실행 (API + 발송 워커)
+
+```bash
+strongemail init-secrets > .env && . ./.env     # 마스터 키·수신거부 키·관리자 토큰 생성 (비밀 저장소에 보관)
+strongemail service-spf --config config.json    # _spf.<서비스도메인> 레코드 → 서비스 DNS 에 등록
+strongemail serve --config config.json          # API + 발송 워커 + 도메인 하루 1회 재검증
+```
+
+설정 파일 예시는 `strongemail/server.py` 상단에 있습니다. 비밀값은 설정 파일이 아니라 환경변수로 받습니다.
+DKIM 개인키는 마스터 키로 **암호화되어** DB 에 저장되고, API 키는 **해시만** 저장됩니다.
+
+### 고객 온보딩 흐름
+
+```bash
+# 1) (운영자) 고객사 생성 → API 키 발급 (한 번만 표시)
+curl -X POST $API/v1/admin/tenants -H "Authorization: Bearer $STRONGEMAIL_ADMIN_TOKEN" \
+  -d '{"id":"shop","name":"예시상점","sender_name":"(주)예시상점","sender_contact":"02-123-4567"}'
+
+# 2) (고객) 발신 도메인 등록 → DKIM 키 자동 생성, DNS 에 넣을 레코드 반환
+curl -X POST $API/v1/domains -H "Authorization: Bearer $KEY" -d '{"domain":"shop.co.kr"}'
+#   shop.co.kr                     TXT  v=spf1 include:_spf.svc.kr ~all   (기존 SPF 가 있으면 합친 값)
+#   se202610._domainkey.shop.co.kr TXT  v=DKIM1; k=rsa; p=...
+#   _dmarc.shop.co.kr              TXT  v=DMARC1; p=none; rua=...
+#   bounce.shop.co.kr              MX   10 mx.svc.kr
+#   bounce.shop.co.kr              TXT  v=spf1 include:_spf.svc.kr -all
+
+# 3) (고객) DNS 등록 후 검증 → 통과해야 발송 접수
+curl -X POST $API/v1/domains/shop.co.kr/verify -H "Authorization: Bearer $KEY"
+
+# 4) (고객) 발송 → 큐 등록 (202), 상태 조회
+curl -X POST $API/v1/messages -H "Authorization: Bearer $KEY" -d '{
+  "from":"news@shop.co.kr","from_name":"예시상점","to":"user@naver.com",
+  "subject":"(광고) 가을 세일","html":"<p>...</p>","category":"marketing",
+  "consent":{"opted_in_at":"2026-03-01T10:00:00+09:00"},
+  "idempotency_key":"fall-sale:user@naver.com"}'
+curl $API/v1/messages/1 -H "Authorization: Bearer $KEY"
+```
+
+| API | 설명 |
+|---|---|
+| `POST /v1/domains` | 발신 도메인 등록. 포털·무료메일(naver.com 등)·서비스 도메인·다른 고객 도메인은 거부 |
+| `GET /v1/domains[/<도메인>]` | 목록 / 레코드·검증 상태 |
+| `POST /v1/domains/<도메인>/verify` | SPF(서비스 IP 전부 허용?)·DKIM(키 일치?)·DMARC 검증 |
+| `DELETE /v1/domains/<도메인>` | 등록 해제 |
+| `POST /v1/messages` | 발송 접수. 미검증 도메인·남의 도메인·동의 없는 광고·보호 헤더 변경은 422 |
+| `GET` / `DELETE /v1/messages/<id>` | 상태 조회 / 대기 중 취소 (자기 것만) |
+| `GET /v1/stats` | 큐 현황, 24시간 평판 지표, 정지 여부 |
+| `POST /v1/admin/tenants[/<id>/suspend\|resume]` | 고객사 생성(API 키 발급), 정지/재개 |
+| `GET /v1/admin/incidents` | 진행 중 IP 차단 사고 |
+| `GET\|POST /unsubscribe?t=` | 원클릭 수신거부 |
+
+> `serve` 는 표준 라이브러리 WSGI 서버라 소규모·개발용입니다. 운영에서는 gunicorn 등으로 `service.api` 를 띄우고
+> `strongemail worker` 를 별도 프로세스로 실행하세요. HTTPS 는 앞단 프록시(nginx 등)에서 처리합니다.
+
 ## 발송 큐와 재시도 워커
 
 `mailer.send` 는 한 번만 시도합니다. 실제 서비스에서는 큐에 넣고 워커가 재시도 일정을 관리합니다.
@@ -257,6 +311,9 @@ strongemail/
   unsubscribe.py  RFC 8058 원클릭 수신거부 토큰/엔드포인트
   sender.py       발송 파이프라인 (관문 → IP 선택 → 고객 도메인 DKIM 서명 → SMTP → 결과 기록), Relay/DirectMX 전송
   tenants.py      고객사·고객 발신 도메인 레지스트리 (도메인 소유 확인, 풀 지정, 정지)
+  api.py          고객용 HTTP API (도메인 등록·검증, 발송, 상태) + 관리자 API
+  tenant_store.py 고객사·도메인·DKIM 키(암호화)·API 키(해시) SQLite 저장
+  server.py       설정 → 서비스 조립, API + 워커 + 재검증 실행
   mailqueue.py    발송 큐(우선순위·예약·중복 방지·만료) + 재시도 워커
   ip_pool.py      IP 풀, IP·포털별 웜업 한도, 차단 IP 제외, 돌려막기 방지
   domain_setup.py SPF/DKIM/DMARC 레코드 생성·병합, DKIM 키 생성, DMARC 단계 계획, 발신 도메인 검증
@@ -267,7 +324,8 @@ strongemail/
 ## 다음 단계 (아직 없는 것)
 
 - 대량이면 KumoMTA·Postfix 같은 MTA 앞단에 이 코어를 둠 (큐는 SQLite 기반 → 여러 서버면 PostgreSQL 로 교체)
-- 고객사·DKIM 개인키 영구 저장 (현재 메모리 레지스트리 → DB + KMS), 고객용 도메인 등록 API/화면
+- 고객용 관리 화면(웹), DKIM 키 교체 API (새 selector 병행 게시 → 전환)
+- 마스터 키를 KMS/Vault 로 (현재 환경변수)
 - VERP 반송 주소 생성(고객사·IP 식별)
 - 반송(DSN)·ARF 메일함 파서, DMARC 집계 리포트(rua) 분석기
 - 참여도 기반 수신자 정리 (6~12개월 무반응 수신자 제외)

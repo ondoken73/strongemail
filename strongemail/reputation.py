@@ -147,7 +147,7 @@ class ReputationMonitor:
     """Records delivery outcomes and decides whether a domain/provider pair may keep sending."""
 
     def __init__(self, store: Store, thresholds: Thresholds = Thresholds(), clock=time.time):
-        self._s = store
+        self._s = self.store = store
         self.thresholds = thresholds
         self._clock = clock
         self.suppressions = SuppressionList(store)

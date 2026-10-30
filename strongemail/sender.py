@@ -17,7 +17,9 @@ from enum import Enum
 from html import escape
 from typing import Protocol
 
+from .blocklist import IncidentLog, detect_block_source
 from .compliance import SenderIdentity, lint_message
+from .domain_setup import SenderDomainRegistry
 from .domains import domain_of
 from .findings import Finding, Severity, has_errors
 from .providers import ProviderProfile, provider_for
@@ -115,6 +117,8 @@ class MailerConfig:
     # 야간(21~08시) 광고 별도 동의는 법 제50조③ 단서·시행령 제61조로 전자우편은 제외된다.
     # SMS/푸시와 같은 정책을 자율적으로 적용하려면 True.
     enforce_night_consent: bool = False
+    sending_ip: str | None = None       # 이 Mailer 가 쓰는 발송 IP (차단 사고 추적 단위)
+    require_verified_domain: bool = True
 
     @property
     def sending_domain(self) -> str:
@@ -130,6 +134,8 @@ class Mailer:
         self.throttle = throttle or ProviderThrottle()
         self.tokens = UnsubscribeTokens(config.unsubscribe_secret)
         self._clock = clock
+        self.incidents = IncidentLog(monitor.store, clock=clock)
+        self.domains = SenderDomainRegistry(monitor.store, clock=clock)
 
     # ------------------------------------------------------------------ gates
 
@@ -150,11 +156,22 @@ class Mailer:
             return "야간(21:00~08:00) 광고 발송에는 별도 동의가 필요합니다"
         return None
 
+    def _warmup_start(self, provider: ProviderProfile) -> date | None:
+        """웜업 시작일. 차단이 해제된 포털은 해제일부터 다시 웜업한다."""
+        start = self.cfg.warmup_started
+        if self.cfg.sending_ip:
+            resolved = self.incidents.last_resolved(self.cfg.sending_ip, provider.key)
+            if resolved is not None:
+                rewarm = datetime.fromtimestamp(resolved, KST).date()
+                start = rewarm if start is None else max(start, rewarm)
+        return start
+
     def _warmup_cap(self, provider: ProviderProfile) -> int | None:
-        if self.cfg.warmup_started is None:
+        start = self._warmup_start(provider)
+        if start is None:
             return None
         today = self._now().date()
-        cap = self.cfg.warmup.cap(today.toordinal() - self.cfg.warmup_started.toordinal())
+        cap = self.cfg.warmup.cap(today.toordinal() - start.toordinal())
         if cap >= self.cfg.warmup.max_daily:
             return None
         midnight = datetime.combine(today, datetime.min.time(), KST).timestamp()
@@ -223,6 +240,13 @@ class Mailer:
         provider = provider_for(email.to)
         domain = self.cfg.sending_domain
 
+        if self.cfg.require_verified_domain:
+            ok, why = self.domains.status(domain)
+            if not ok:
+                return SendResult(Status.REJECTED, why)
+        if self.cfg.sending_ip and (inc := self.incidents.blocking(self.cfg.sending_ip, provider.key)):
+            return SendResult(Status.DEFERRED, f"발송 IP {inc.ip} 가 {inc.target} 에서 차단됨 (사고 #{inc.id}, "
+                                               f"{inc.state.value}) — 해제 전까지 발송 중지", retry_after=3600)
         if reason := self.monitor.suppressions.blocked_reason(email.to, marketing):
             return SendResult(Status.REJECTED, f"수신 제외 목록: {reason}")
         if marketing and (problem := self._consent_problem(email)):
@@ -253,6 +277,8 @@ class Mailer:
         self.monitor.record(kind, email.to, provider.key, domain)
         if kind is BounceKind.DELIVERED:
             return SendResult(Status.SENT, smtp_code=code, bounce=kind, findings=findings)
+        if kind is BounceKind.BLOCKED and self.cfg.sending_ip:
+            self.incidents.open(self.cfg.sending_ip, detect_block_source(text, provider.key), f"{code} {text}")
         if kind is BounceKind.THROTTLED:
             self.throttle.report_throttled(provider)
             return SendResult(Status.DEFERRED, text, retry_after=60, smtp_code=code, bounce=kind, findings=findings)

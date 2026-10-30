@@ -1,3 +1,5 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(__file__))
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa

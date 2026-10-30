@@ -31,11 +31,13 @@ def setup(dkim_key):
             dkim_selector="s1", dkim_private_key=pem,
             sender_identity=SenderIdentity("(주)예시상점", "02-123-4567"),
             unsubscribe_base_url="https://mail.example.co.kr", unsubscribe_secret=b"s" * 32,
-            warmup_started=warmup_started, enforce_night_consent=night_rule,
+            warmup_started=warmup_started, enforce_night_consent=night_rule, sending_ip="203.0.113.10",
         )
         transport = FakeTransport(reply)
         monitor = ReputationMonitor(Store(), clock=lambda: at)
-        return Mailer(cfg, monitor, transport, clock=lambda: at), transport, pub
+        mailer = Mailer(cfg, monitor, transport, clock=lambda: at)
+        mailer.domains.mark_verified("example.co.kr")
+        return mailer, transport, pub
     return make
 
 
@@ -129,3 +131,39 @@ def test_lint_flags_freemail_from_and_misalignment():
     msg.set_content("x")
     codes = {f.code for f in lint_message(msg, marketing=False, dkim_domain="esp.com")}
     assert {"FROM_FREEMAIL", "DKIM_NOT_ALIGNED", "HEADER_MISSING"} <= codes
+
+
+def test_unverified_domain_cannot_send(setup):
+    mailer, transport, _ = setup()
+    mailer.monitor.store.execute("DELETE FROM sender_domains")
+    r = mailer.send(OutgoingEmail(to="a@gmail.com", subject="안내", text="안내"))
+    assert r.status is Status.REJECTED and "검증" in r.reason and transport.sent == []
+
+
+def test_block_opens_incident_and_stops_only_that_portal(setup):
+    mailer, transport, _ = setup(reply=(554, "5.7.1 Message blocked due to poor reputation"))
+    r = mailer.send(OutgoingEmail(to="a@naver.com", subject="안내", text="안내"))
+    assert r.bounce is BounceKind.BLOCKED
+    [inc] = mailer.incidents.active()
+    assert inc.target == "naver"
+    transport.reply = (250, "OK")
+    r = mailer.send(OutgoingEmail(to="b@naver.com", subject="안내", text="안내"))
+    assert r.status is Status.DEFERRED and "차단" in r.reason
+    assert mailer.send(OutgoingEmail(to="b@gmail.com", subject="안내", text="안내")).status is Status.SENT
+
+
+def test_dnsbl_block_stops_every_portal(setup):
+    mailer, _, _ = setup(reply=(554, "5.7.1 Service unavailable; client host blocked using zen.spamhaus.org"))
+    mailer.send(OutgoingEmail(to="a@daum.net", subject="안내", text="안내"))
+    assert mailer.incidents.active()[0].target == "spamhaus"
+    assert mailer.send(OutgoingEmail(to="b@gmail.com", subject="안내", text="안내")).status is Status.DEFERRED
+
+
+def test_resolved_incident_restarts_warmup(setup):
+    mailer, transport, _ = setup()
+    inc = mailer.incidents.open("203.0.113.10", "naver", "554 blocked")
+    mailer.incidents.resolve(inc.id)
+    mailer.throttle.acquire = lambda p: 0.0
+    results = [mailer.send(OutgoingEmail(to=f"u{i}@naver.com", subject="안내", text="안내")) for i in range(51)]
+    assert results[49].status is Status.SENT and "웜업" in results[50].reason
+    assert mailer.send(OutgoingEmail(to="x@gmail.com", subject="안내", text="안내")).status is Status.SENT
